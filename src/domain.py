@@ -74,6 +74,7 @@ def normalize_create(payload):
         "notifications": [],
         "response_actions": [],
         "sample_results": [],
+        "sample_ledger_version": 0,
         "_stable_key": stable_key,
     }
 

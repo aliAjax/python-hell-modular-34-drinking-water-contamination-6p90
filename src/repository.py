@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
+from .samples import derive_result
 
 
 def now_iso():
@@ -69,6 +70,43 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    zone_id TEXT NOT NULL,
+                    sample_id TEXT NOT NULL,
+                    sampling_at TEXT NOT NULL,
+                    valid_until TEXT NOT NULL,
+                    completed_at TEXT,
+                    concentration REAL,
+                    result TEXT,
+                    status TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    is_current INTEGER NOT NULL DEFAULT 0,
+                    idempotency_key TEXT,
+                    submitted_by TEXT NOT NULL,
+                    submitted_role TEXT NOT NULL,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    invalidated_at TEXT,
+                    invalidated_reason TEXT,
+                    UNIQUE(item_id, sample_id),
+                    UNIQUE(item_id, idempotency_key),
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_samples_item_zone ON samples(item_id, zone_id);
+                CREATE INDEX IF NOT EXISTS idx_samples_item_status ON samples(item_id, status);
+                CREATE TABLE IF NOT EXISTS restoration_approvals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    sample_ledger_version INTEGER NOT NULL,
+                    approved_by TEXT NOT NULL,
+                    approved_role TEXT NOT NULL,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(item_id) REFERENCES items(id)
                 );
                 """
             )
@@ -257,5 +295,308 @@ class Repository:
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
             return {"counts": counts, "items": self.list_items()}
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # 片区样本台账
+    # ------------------------------------------------------------------
+
+    def _sample_to_row(self, row):
+        if row is None:
+            return None
+        result = dict(row)
+        result["is_current"] = bool(result["is_current"])
+        return result
+
+    def _bump_ledger_version(self, conn, item_id, now):
+        row = conn.execute("SELECT payload FROM items WHERE id=?", (item_id,)).fetchone()
+        payload = json.loads(row["payload"])
+        payload["sample_ledger_version"] = int(payload.get("sample_ledger_version", 0)) + 1
+        conn.execute("UPDATE items SET payload=?, updated_at=? WHERE id=?", (canonical_json(payload), now, item_id))
+        return payload["sample_ledger_version"]
+
+    def _recompute_current(self, conn, item_id, zone_id, now):
+        # 有效样本 = 未作废样本中采样时刻最新者；按采样时刻决定是否推翻原结论
+        row = conn.execute(
+            "SELECT id FROM samples WHERE item_id=? AND zone_id=? AND status!='invalidated' "
+            "ORDER BY sampling_at DESC, id DESC LIMIT 1",
+            (item_id, zone_id),
+        ).fetchone()
+        conn.execute(
+            "UPDATE samples SET is_current=0, updated_at=? WHERE item_id=? AND zone_id=?",
+            (now, item_id, zone_id),
+        )
+        if row is not None:
+            conn.execute("UPDATE samples SET is_current=1, updated_at=? WHERE id=?", (now, row["id"]))
+        return row["id"] if row else None
+
+    def next_sample_version(self, conn, item_id, zone_id):
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM samples WHERE item_id=? AND zone_id=?",
+            (item_id, zone_id),
+        ).fetchone()
+        return int(row["v"]) + 1
+
+    def count_in_progress(self, item_id):
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM samples WHERE item_id=? AND status='in_progress'",
+                (item_id,),
+            ).fetchone()
+            return int(row["c"])
+        finally:
+            conn.close()
+
+    def get_sample(self, sample_pk):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT * FROM samples WHERE id=?", (sample_pk,)).fetchone()
+            if row is None:
+                raise NotFoundError("sample_not_found", "样本不存在")
+            return self._sample_to_row(row)
+        finally:
+            conn.close()
+
+    def list_samples(self, item_id, zone_id=None, status=None, current_only=False):
+        conn = self.connect()
+        try:
+            sql = "SELECT * FROM samples WHERE item_id=?"
+            params = [item_id]
+            if zone_id:
+                sql += " AND zone_id=?"
+                params.append(zone_id)
+            if status:
+                sql += " AND status=?"
+                params.append(status)
+            if current_only:
+                sql += " AND is_current=1"
+            sql += " ORDER BY id DESC"
+            rows = conn.execute(sql, params).fetchall()
+            return [self._sample_to_row(row) for row in rows]
+        finally:
+            conn.close()
+
+    def register_sample(self, item_id, zone_id, sample_id, sampling_at, valid_until, concentration,
+                        capacity, idempotency_key, expected_version, actor, role, note, now):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if item is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            limit = float(json.loads(item["payload"]).get("limit", 0))
+
+            # 幂等：保存失败后重试同一幂等键，不新增样本
+            if idempotency_key:
+                existing = conn.execute(
+                    "SELECT * FROM samples WHERE item_id=? AND idempotency_key=?",
+                    (item_id, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute("COMMIT")
+                    return self._sample_to_row(existing), False
+
+            # 业务样本号去重：重复提交不增加样本数
+            existing = conn.execute(
+                "SELECT * FROM samples WHERE item_id=? AND sample_id=?",
+                (item_id, sample_id),
+            ).fetchone()
+            if existing is not None:
+                conn.execute("COMMIT")
+                return self._sample_to_row(existing), False
+
+            # 乐观并发：两个登记员同时提交同一片区，后到者按最新版本重报
+            current_version = self.next_sample_version(conn, item_id, zone_id) - 1
+            if expected_version is not None and int(expected_version) != current_version:
+                raise ConflictError("version_conflict", "样本版本已更新，请重新读取最新版本后重报")
+
+            version = current_version + 1
+            if concentration is not None:
+                status = "completed"
+                completed_at = now
+                result = derive_result(concentration, limit)
+            else:
+                completed_at = None
+                result = None
+                in_progress = conn.execute(
+                    "SELECT COUNT(*) AS c FROM samples WHERE item_id=? AND status='in_progress'",
+                    (item_id,),
+                ).fetchone()["c"]
+                status = "in_progress" if int(in_progress) < int(capacity) else "queued"
+
+            conn.execute(
+                "INSERT INTO samples(item_id,zone_id,sample_id,sampling_at,valid_until,completed_at,"
+                "concentration,result,status,version,is_current,idempotency_key,submitted_by,"
+                "submitted_role,note,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (item_id, zone_id, sample_id, sampling_at, valid_until, completed_at, concentration,
+                 result, status, version, 0, idempotency_key, actor, role, note, now, now),
+            )
+            pk = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            self._recompute_current(conn, item_id, zone_id, now)
+            self._bump_ledger_version(conn, item_id, now)
+            self.append_audit(
+                conn, item_id, "sample_registered", actor, role,
+                {"sample_id": sample_id, "zone_id": zone_id, "version": version,
+                 "status": status, "sampling_at": sampling_at},
+            )
+            conn.execute("COMMIT")
+            return self.get_sample(pk), True
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def complete_sample(self, sample_pk, concentration, actor, role, now):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM samples WHERE id=?", (sample_pk,)).fetchone()
+            if row is None:
+                raise NotFoundError("sample_not_found", "样本不存在")
+            if row["status"] == "invalidated":
+                raise DomainError("sample_invalidated", "样本已作废，不能完成检测")
+            if row["status"] == "completed":
+                conn.execute("COMMIT")
+                return self._sample_to_row(row), False
+            limit = float(json.loads(conn.execute("SELECT payload FROM items WHERE id=?", (row["item_id"],)).fetchone()["payload"]).get("limit", 0))
+            result = derive_result(concentration, limit)
+            conn.execute(
+                "UPDATE samples SET concentration=?, result=?, status='completed', completed_at=?, updated_at=? WHERE id=?",
+                (concentration, result, now, now, sample_pk),
+            )
+            # 容量释放后，排队中最早的样本转入检测
+            next_queued = conn.execute(
+                "SELECT id FROM samples WHERE item_id=? AND status='queued' ORDER BY id ASC LIMIT 1",
+                (row["item_id"],),
+            ).fetchone()
+            if next_queued is not None:
+                conn.execute(
+                    "UPDATE samples SET status='in_progress', updated_at=? WHERE id=?",
+                    (now, next_queued["id"]),
+                )
+            self._recompute_current(conn, row["item_id"], row["zone_id"], now)
+            self._bump_ledger_version(conn, row["item_id"], now)
+            self.append_audit(
+                conn, row["item_id"], "sample_completed", actor, role,
+                {"sample_id": row["sample_id"], "zone_id": row["zone_id"],
+                 "concentration": concentration, "result": result},
+            )
+            conn.execute("COMMIT")
+            return self.get_sample(sample_pk), True
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def change_zones(self, item_id, new_zone_ids, actor, role, now):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            payload = json.loads(row["payload"])
+            old_zones = list(payload.get("zone_ids", []))
+            payload["zone_ids"] = list(new_zone_ids)
+            # 区域范围一变，现有结果全部作废并重新取样
+            cur = conn.execute(
+                "SELECT id FROM samples WHERE item_id=? AND status!='invalidated'",
+                (item_id,),
+            ).fetchall()
+            count = 0
+            for sample_row in cur:
+                conn.execute(
+                    "UPDATE samples SET status='invalidated', is_current=0, invalidated_at=?, "
+                    "invalidated_reason=?, updated_at=? WHERE id=?",
+                    (now, "zone_range_changed", now, sample_row["id"]),
+                )
+                count += 1
+            payload["sample_ledger_version"] = int(payload.get("sample_ledger_version", 0)) + 1
+            conn.execute("UPDATE items SET payload=?, updated_at=? WHERE id=?",
+                        (canonical_json(payload), now, item_id))
+            self.append_audit(
+                conn, item_id, "zone_range_changed", actor, role,
+                {"old_zones": old_zones, "new_zones": list(new_zone_ids), "invalidated": count},
+            )
+            conn.execute("COMMIT")
+            return self.get_item(item_id), count
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def add_approval(self, item_id, actor, role, note, now):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            payload = json.loads(row["payload"])
+            ledger_version = int(payload.get("sample_ledger_version", 0))
+            conn.execute(
+                "INSERT INTO restoration_approvals(item_id,sample_ledger_version,approved_by,"
+                "approved_role,note,created_at) VALUES(?,?,?,?,?,?)",
+                (item_id, ledger_version, actor, role, note, now),
+            )
+            pk = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            self.append_audit(
+                conn, item_id, "restoration_approved", actor, role,
+                {"sample_ledger_version": ledger_version, "note": note},
+            )
+            conn.execute("COMMIT")
+            return self.get_approval(pk)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def get_approval(self, approval_pk):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT * FROM restoration_approvals WHERE id=?", (approval_pk,)).fetchone()
+            if row is None:
+                raise NotFoundError("approval_not_found", "恢复审批不存在")
+            return dict(row)
+        finally:
+            conn.close()
+
+    def latest_approval(self, item_id):
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM restoration_approvals WHERE item_id=? ORDER BY id DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def list_approvals(self, item_id):
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM restoration_approvals WHERE item_id=? ORDER BY id DESC",
+                (item_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
         finally:
             conn.close()

@@ -2,7 +2,7 @@ import json
 import mimetypes
 import os
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from .domain import DomainError
 
@@ -45,6 +45,7 @@ def build_handler(service, static_dir):
 
         def do_GET(self):
             try:
+                actor, role, region = self._identity()
                 path = urlparse(self.path).path
                 if path == "/health":
                     return self._send(200, {"status": "ok"})
@@ -58,6 +59,18 @@ def build_handler(service, static_dir):
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "audit":
                     item = service.get_item(int(parts[2]))
                     return self._send(200, {"events": item["audit"]})
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "samples":
+                    query = parse_qs(urlparse(self.path).query)
+                    zone_id = query.get("zone_id", [None])[0]
+                    status = query.get("status", [None])[0]
+                    current_only = query.get("current", ["0"])[0] in ("1", "true", "yes")
+                    return self._send(200, {"samples": service.list_samples(int(parts[2]), zone_id, status, current_only)})
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "lab-queue":
+                    return self._send(200, service.lab_queue(int(parts[2]), actor, role, region))
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "clearance":
+                    return self._send(200, service.clearance(int(parts[2]), actor, role, region))
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "restoration-approvals":
+                    return self._send(200, {"approvals": service.list_approvals(int(parts[2]), actor, role, region)})
                 if path == "/":
                     file_path = os.path.join(static_dir, "index.html")
                     with open(file_path, "rb") as handle:
@@ -86,6 +99,18 @@ def build_handler(service, static_dir):
                         raise DomainError("action_required", "缺少 action", 400)
                     expected = payload.pop("expected_version", None)
                     return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region))
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "samples":
+                    sample, created = service.register_sample(int(parts[2]), payload, actor, role, region)
+                    return self._send(201 if created else 200, {"sample": sample, "created": created})
+                if len(parts) == 6 and parts[:2] == ["api", "items"] and parts[3] == "samples" and parts[5] == "complete":
+                    sample, completed = service.complete_sample(int(parts[4]), payload, actor, role, region)
+                    return self._send(200, {"sample": sample, "completed": completed})
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "zones":
+                    result = service.change_zones(int(parts[2]), payload, actor, role, region)
+                    return self._send(200, result)
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "restoration-approvals":
+                    approval = service.approve_restoration(int(parts[2]), payload, actor, role, region)
+                    return self._send(201, {"approval": approval})
                 return self._send(404, {"error": "not_found", "message": "接口不存在"})
             except DomainError as exc:
                 return self._error(exc)

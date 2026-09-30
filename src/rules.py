@@ -108,13 +108,20 @@ def apply_action(item, action, payload, actor, role):
         return "sampled", current, {"sample_result": result}
 
     if action == "restore":
-        _need_status(item, {"sampled"})
+        _need_status(item, {"sampled", "disinfected"})
         if not payload.get("all_zones_cleared"):
             raise DomainError("zones_not_cleared", "仍有区域未完成水质恢复", 409)
         limit = float(current.get("limit", 0))
-        results = current.get("sample_results", [])
-        if not results or any(float(result["concentration"]) > limit for result in results):
-            raise DomainError("quality_not_met", "复检结果未全部达到限值", 409)
+        sampling = current.get("sampling")
+        if sampling:
+            from .ledger import all_zones_approved
+            all_approved, missing = all_zones_approved(current, limit)
+            if missing:
+                raise DomainError("zones_not_approved", "以下片区未达标或未审批恢复: %s" % ", ".join(missing), 409)
+        else:
+            results = current.get("sample_results", [])
+            if not results or any(float(result["concentration"]) > limit for result in results):
+                raise DomainError("quality_not_met", "复检结果未全部达到限值", 409)
         current["restoration"] = {"actor": actor, "note": payload.get("note", "")}
         return "restored", current, {"restoration": current["restoration"]}
 

@@ -237,6 +237,46 @@ class Repository:
         finally:
             conn.close()
 
+    def mutate_item(self, item_id, event_type, actor, role, mutator, expected_version=None):
+        """在单个事务里读取-修改-落库 item.payload。
+
+        mutator 是纯函数 ``payload -> event_payload``，可在内部抛 DomainError。
+        当 event_payload 含 ``dedup=True`` 时视为幂等重放：不做版本校验、不产生
+        新版本和审计事件，直接返回当前记录（用于保存失败后的安全重试）。
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            payload = json.loads(row["payload"])
+            event_payload = mutator(payload)
+            dedup = bool(event_payload.get("dedup"))
+            if not dedup:
+                if expected_version is not None and int(expected_version) != int(row["version"]):
+                    raise ConflictError("version_conflict", "记录已被其他操作更新，请按最新版本重报")
+                version = int(row["version"]) + 1
+                conn.execute(
+                    "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                    (row["status"], version, canonical_json(payload), now_iso(), item_id),
+                )
+                conn.execute(
+                    "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                    (item_id, event_type, actor, role, canonical_json(event_payload), now_iso()),
+                )
+                self.append_audit(conn, item_id, event_type, actor, role, event_payload)
+            conn.execute("COMMIT")
+            return self.get_item(item_id), event_payload
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def audit_trail(self, item_id):
         conn = self.connect()
         try:

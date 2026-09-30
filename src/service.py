@@ -1,4 +1,4 @@
-from . import domain, rules
+from . import domain, rules, ledger
 from .domain import DomainError
 
 
@@ -60,7 +60,118 @@ class Service:
         item["sources"] = self.repository.list_sources(item_id)
         item["audit"] = self.repository.audit_trail(item_id)
         item["assessment"] = rules.assess(item["payload"])
+        sampling = item["payload"].get("sampling")
+        if sampling:
+            limit = float(item["payload"].get("limit", 0))
+            item["sampling"] = self._sampling_summary(item["payload"], limit)
         return item
+
+    def _sampling_summary(self, payload, limit):
+        sampling = payload["sampling"]
+        zones = [ledger.zone_status(sampling, zone_id, limit) for zone_id in payload.get("zone_ids", [])]
+        all_approved, missing = ledger.all_zones_approved(payload, limit)
+        approved_ids = {a["sample_id"] for a in sampling.get("approvals", []) if a.get("decision") == "approved"}
+        return {
+            "round": sampling["round"],
+            "lab_capacity": sampling.get("lab_capacity"),
+            "queue": list(sampling["queue"]),
+            "zones": zones,
+            "pending_approval": [z["zone_id"] for z in zones
+                                 if z["passed"] and z["current_sample_id"] not in approved_ids],
+            "all_approved": all_approved,
+            "missing": missing,
+            "approvals": sampling.get("approvals", []),
+        }
+
+    # ---- 片区样本 / 实验室排队 / 恢复审批 ----
+
+    def _require_ledger_role(self, role, allowed, action):
+        if role not in allowed:
+            raise DomainError("forbidden", "当前角色不能%s" % action, 403)
+
+    def register_sample(self, item_id, payload, actor, role):
+        if not actor or not role:
+            raise DomainError("identity_required", "需要用户身份和角色", 401)
+        self._require_ledger_role(role, ledger.REGISTER_ROLES, "登记片区样本")
+        data = domain.normalize_sample_registration(payload)
+        item = self.repository.get_item(item_id)
+        if item["status"] not in ("disinfected", "sampled"):
+            raise DomainError("invalid_state", "冲洗消毒完成后才能登记复检样本（当前 %s）" % item["status"], 409)
+        capacity = data.get("lab_capacity") or ledger.DEFAULT_LAB_CAPACITY
+        data["actor"] = actor
+
+        def mutator(current):
+            _, event = ledger.register_sample(current, data, capacity)
+            return event
+
+        updated, _ = self.repository.mutate_item(
+            item_id, "sample_registered", actor, role, mutator, data.get("expected_version")
+        )
+        return self.get_item(updated["id"])
+
+    def submit_sample_result(self, item_id, payload, actor, role):
+        if not actor or not role:
+            raise DomainError("identity_required", "需要用户身份和角色", 401)
+        self._require_ledger_role(role, ledger.RESULT_ROLES, "提交实验室结果")
+        data = domain.normalize_sample_result(payload)
+        item = self.repository.get_item(item_id)
+        limit = float(item["payload"].get("limit", 0))
+
+        def mutator(current):
+            _, event = ledger.submit_result(current, data, limit)
+            return event
+
+        updated, _ = self.repository.mutate_item(
+            item_id, "sample_result_submitted", actor, role, mutator, data.get("expected_version")
+        )
+        return self.get_item(updated["id"])
+
+    def change_scope(self, item_id, payload, actor, role):
+        if not actor or not role:
+            raise DomainError("identity_required", "需要用户身份和角色", 401)
+        self._require_ledger_role(role, ledger.SCOPE_ROLES, "变更恢复区域范围")
+        data = domain.normalize_scope_change(payload)
+        item = self.repository.get_item(item_id)
+        if item["status"] == "restored":
+            raise DomainError("invalid_state", "已恢复供水，区域范围不能再变更", 409)
+
+        def mutator(current):
+            current["zone_ids"] = data["zone_ids"]
+            return ledger.change_scope(current, data)
+
+        updated, _ = self.repository.mutate_item(
+            item_id, "scope_changed", actor, role, mutator, data["expected_version"]
+        )
+        return self.get_item(updated["id"])
+
+    def approve_restore(self, item_id, payload, actor, role):
+        if not actor or not role:
+            raise DomainError("identity_required", "需要用户身份和角色", 401)
+        self._require_ledger_role(role, ledger.APPROVE_ROLES, "审批恢复供水")
+        data = domain.normalize_approval(payload)
+        item = self.repository.get_item(item_id)
+        if item["status"] == "restored":
+            raise DomainError("invalid_state", "该事件已恢复供水", 409)
+        limit = float(item["payload"].get("limit", 0))
+        data["actor"] = actor
+
+        def mutator(current):
+            return ledger.approve_restore(current, data, limit)
+
+        updated, _ = self.repository.mutate_item(
+            item_id, "restore_approved", actor, role, mutator, data["expected_version"]
+        )
+        return self.get_item(updated["id"])
+
+    def pending(self, item_id, actor, role):
+        if not actor or not role:
+            raise DomainError("identity_required", "需要用户身份和角色", 401)
+        self._require_ledger_role(role, ledger.PENDING_VIEW_ROLES, "查看待审批片区")
+        item = self.repository.get_item(item_id)
+        limit = float(item["payload"].get("limit", 0))
+        zones = ledger.pending_zones(item["payload"], limit)
+        return {"item_id": item_id, "round": item["payload"].get("sampling", {}).get("round"),
+                "pending_approval": zones}
 
     def list_items(self, status=None):
         return self.repository.list_items(status)

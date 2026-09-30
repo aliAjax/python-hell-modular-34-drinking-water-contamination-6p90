@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 
 class DomainError(Exception):
@@ -91,3 +91,100 @@ def normalize_source(payload):
         "note": payload.get("note", ""),
     }
     return result
+
+
+def parse_dt(value):
+    """解析 ISO 时间字符串，缺时区按 UTC 处理，返回带时区的 datetime。"""
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def optional_version(payload):
+    value = payload.get("expected_version")
+    if value is None:
+        return None
+    try:
+        version = int(value)
+    except (TypeError, ValueError):
+        raise DomainError("invalid_version", "expected_version 必须是整数")
+    if version < 1:
+        raise DomainError("invalid_version", "expected_version 必须大于 0")
+    return version
+
+
+def normalize_sample_registration(payload):
+    sample_id = require_text(payload, "sample_id")
+    zone_id = require_text(payload, "zone_id")
+    sampled_at = parse_timestamp(payload, "sampled_at")
+    validity_hours = payload.get("validity_hours")
+    valid_until = payload.get("valid_until")
+    if valid_until is not None:
+        valid_until = parse_timestamp(payload, "valid_until")
+    elif validity_hours is not None:
+        hours = number(payload, "validity_hours", 0.0001)
+        valid_until = (parse_dt(sampled_at) + timedelta(hours=hours)).isoformat()
+    else:
+        raise DomainError("validity_required", "必须提供 valid_until 或 validity_hours")
+    if parse_dt(valid_until) <= parse_dt(sampled_at):
+        raise DomainError("invalid_validity", "有效期截止时刻必须晚于采样时刻")
+    lab_capacity = payload.get("lab_capacity")
+    if lab_capacity is not None:
+        lab_capacity = int(number(payload, "lab_capacity", 1))
+    expected_version = optional_version(payload)
+    return {
+        "sample_id": sample_id,
+        "zone_id": zone_id,
+        "sampled_at": sampled_at,
+        "valid_until": valid_until,
+        "lab_capacity": lab_capacity,
+        "note": payload.get("note", ""),
+        "expected_version": expected_version,
+    }
+
+
+def normalize_sample_result(payload):
+    sample_id = require_text(payload, "sample_id")
+    completed_at = parse_timestamp(payload, "completed_at")
+    concentration = number(payload, "concentration", 0)
+    expected_version = optional_version(payload)
+    return {
+        "sample_id": sample_id,
+        "completed_at": completed_at,
+        "concentration": concentration,
+        "note": payload.get("note", ""),
+        "expected_version": expected_version,
+    }
+
+
+def normalize_scope_change(payload):
+    zones = payload.get("zone_ids")
+    if not isinstance(zones, list) or not zones:
+        raise DomainError("zones_required", "至少需要一个片区")
+    if any(not isinstance(zone, str) or not zone.strip() for zone in zones):
+        raise DomainError("invalid_zones", "片区编号必须是字符串列表")
+    expected_version = optional_version(payload)
+    if expected_version is None:
+        raise DomainError("expected_version_required", "该操作需要 expected_version", 400)
+    return {
+        "zone_ids": [zone.strip() for zone in zones],
+        "reason": payload.get("reason", ""),
+        "expected_version": expected_version,
+    }
+
+
+def normalize_approval(payload):
+    zone_id = require_text(payload, "zone_id")
+    expected_version = optional_version(payload)
+    if expected_version is None:
+        raise DomainError("expected_version_required", "审批需要 expected_version", 400)
+    expected_sample_id = payload.get("expected_sample_id")
+    if expected_sample_id is not None and (not isinstance(expected_sample_id, str) or not expected_sample_id.strip()):
+        raise DomainError("invalid_sample_id", "expected_sample_id 必须是非空字符串")
+    return {
+        "zone_id": zone_id,
+        "expected_version": expected_version,
+        "expected_sample_id": expected_sample_id.strip() if expected_sample_id else None,
+        "note": payload.get("note", ""),
+    }

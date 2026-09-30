@@ -44,7 +44,9 @@ def build_handler(service, static_dir):
             self._send(status, {"error": code, "message": str(exc)})
 
         def do_GET(self):
+            actor = role = region = None
             try:
+                actor, role, region = self._identity()
                 path = urlparse(self.path).path
                 if path == "/health":
                     return self._send(200, {"status": "ok"})
@@ -58,6 +60,8 @@ def build_handler(service, static_dir):
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "audit":
                     item = service.get_item(int(parts[2]))
                     return self._send(200, {"events": item["audit"]})
+                if len(parts) == 5 and parts[:2] == ["api", "items"] and parts[3] == "sampling" and parts[4] == "pending":
+                    return self._send(200, service.pending(int(parts[2]), actor, role))
                 if path == "/":
                     file_path = os.path.join(static_dir, "index.html")
                     with open(file_path, "rb") as handle:
@@ -86,6 +90,17 @@ def build_handler(service, static_dir):
                         raise DomainError("action_required", "缺少 action", 400)
                     expected = payload.pop("expected_version", None)
                     return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region))
+                if len(parts) == 5 and parts[:2] == ["api", "items"] and parts[3] == "sampling":
+                    sub = parts[4]
+                    item_id = int(parts[2])
+                    if sub == "register":
+                        return self._send(201, service.register_sample(item_id, payload, actor, role))
+                    if sub == "results":
+                        return self._send(201, service.submit_sample_result(item_id, payload, actor, role))
+                    if sub == "scope":
+                        return self._send(200, service.change_scope(item_id, payload, actor, role))
+                    if sub == "approve":
+                        return self._send(200, service.approve_restore(item_id, payload, actor, role))
                 return self._send(404, {"error": "not_found", "message": "接口不存在"})
             except DomainError as exc:
                 return self._error(exc)
